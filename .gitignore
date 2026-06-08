@@ -1,0 +1,10 @@
+**/bin/
+**/obj/
+**/node_modules/
+**/publish/
+**/App_Data/
+**/.vs/
+*.user
+deploy/
+backend/LanShare.Api/wwwroot/
+frontend/dist/
