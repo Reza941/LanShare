@@ -240,7 +240,7 @@ export async function deleteShare(token: string, bundleId: string): Promise<void
   if (!res.ok) throw new Error(await parseError(res));
 }
 
-async function fetchFileBlob(fileId: string): Promise<Blob> {
+export async function fetchFileBlob(fileId: string): Promise<Blob> {
   const res = await fetch(`/api/shares/files/${fileId}/download`);
   if (!res.ok) throw new Error(await parseError(res));
   return res.blob();
@@ -258,6 +258,26 @@ function triggerDownload(blob: Blob, fileName: string) {
   a.download = fileName;
   a.click();
   URL.revokeObjectURL(url);
+}
+
+export async function postInstruction(text: string): Promise<void> {
+  await fetch("/api/console", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
+  });
+}
+
+export async function getPending(): Promise<{ instruction?: string; response?: string }> {
+  const res = await fetch("/api/console/pending");
+  if (!res.ok) return {};
+  return res.json();
+}
+
+export async function getResponse(): Promise<{ text?: string }> {
+  const res = await fetch("/api/console/response");
+  if (!res.ok) return {};
+  return res.json();
 }
 
 export function formatSize(bytes: number): string {

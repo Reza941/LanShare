@@ -8,16 +8,34 @@ import {
   downloadAll,
   downloadAllFiles,
   downloadSingleFile,
+  fetchFileBlob,
   fetchShares,
   formatSize,
   formatTime,
+  getPending,
   join,
   leave,
   loadSession,
+  postInstruction,
   validateSession,
 } from "./api";
 import { createHub } from "./signalr";
-import type { Session, ShareBundle } from "./types";
+import type { Session, ShareBundle, ShareFile } from "./types";
+
+function fileIcon(contentType: string): string {
+  if (contentType.startsWith("image/")) return "🖼";
+  if (contentType === "application/pdf") return "📄";
+  if (contentType.startsWith("video/")) return "🎬";
+  if (contentType.startsWith("audio/")) return "🎵";
+  if (contentType.includes("zip") || contentType.includes("rar") || contentType.includes("tar") || contentType.includes("7z") || contentType.includes("gzip"))
+    return "📦";
+  if (contentType.startsWith("text/")) return "📝";
+  if (contentType.includes("word") || contentType.includes("document") || contentType.includes("sheet") || contentType.includes("presentation"))
+    return "📝";
+  if (contentType.includes("json") || contentType.includes("xml") || contentType.includes("javascript"))
+    return "📝";
+  return "📎";
+}
 
 export default function App() {
   const [session, setSession] = useState<Session | null>(null);
@@ -26,17 +44,29 @@ export default function App() {
   const [joining, setJoining] = useState(false);
   const [error, setError] = useState("");
   const [shares, setShares] = useState<ShareBundle[]>([]);
+  const [sharesLoading, setSharesLoading] = useState(true);
   const [connected, setConnected] = useState(false);
   const [toast, setToast] = useState("");
+  const [toastKey, setToastKey] = useState(0);
   const [showModal, setShowModal] = useState(false);
   const [shareTitle, setShareTitle] = useState("");
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [uploadPct, setUploadPct] = useState<number | null>(null);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [downloadProgress, setDownloadProgress] = useState<string | null>(null);
+  const [preview, setPreview] = useState<{ bundleId: string; files: ShareFile[]; index: number } | null>(null);
+  const [previewBlobUrl, setPreviewBlobUrl] = useState<string | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
   const [folderMode, setFolderMode] = useState(false);
   const [addFileBundleId, setAddFileBundleId] = useState<string | null>(null);
   const [addFileFolderMode, setAddFileFolderMode] = useState(false);
+  const [addFileUploadPct, setAddFileUploadPct] = useState<number | null>(null);
+  const [confirmModal, setConfirmModal] = useState<{ message: string; action: () => void } | null>(null);
+  const [showConsole, setShowConsole] = useState(false);
+  const [consoleInput, setConsoleInput] = useState("");
+  const [consoleResponse, setConsoleResponse] = useState<string | null>(null);
+  const [consoleLoading, setConsoleLoading] = useState(false);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const folderRef = useRef<HTMLInputElement>(null);
   const addFileRef = useRef<HTMLInputElement>(null);
@@ -45,12 +75,18 @@ export default function App() {
 
   const showToast = useCallback((msg: string) => {
     setToast(msg);
+    setToastKey((k) => k + 1);
     setTimeout(() => setToast(""), 4000);
   }, []);
 
   const refreshShares = useCallback(async () => {
-    const list = await fetchShares();
-    setShares(list);
+    setSharesLoading(true);
+    try {
+      const list = await fetchShares();
+      setShares(list);
+    } finally {
+      setSharesLoading(false);
+    }
   }, []);
 
   useEffect(() => {
@@ -220,41 +256,110 @@ export default function App() {
         : null
     );
 
+    setAddFileUploadPct(0);
     try {
-      const updated = await addFilesToShare(session.token, addFileBundleId, files, paths);
+      const updated = await addFilesToShare(session.token, addFileBundleId, files, paths, (pct) => setAddFileUploadPct(pct));
       setShares((prev) => prev.map((s) => (s.id === updated.id ? updated : s)));
       showToast(`${files.length} فایل اضافه شد`);
     } catch (err) {
       showToast(err instanceof Error ? err.message : "افزودن فایل ناموفق");
     } finally {
+      setAddFileUploadPct(null);
       setAddFileBundleId(null);
     }
   };
 
+  const loadPreview = useCallback(async (files: ShareFile[], idx: number) => {
+    setPreviewLoading(true);
+    try {
+      if (previewBlobUrl) URL.revokeObjectURL(previewBlobUrl);
+      setPreviewBlobUrl(null);
+      const blob = await fetchFileBlob(files[idx].id);
+      setPreviewBlobUrl(URL.createObjectURL(blob));
+    } catch {
+      showToast("خطا در بارگذاری پیش‌نمایش");
+    } finally {
+      setPreviewLoading(false);
+    }
+  }, [previewBlobUrl, showToast]);
+
+  const openPreview = useCallback((files: ShareFile[], idx: number) => {
+    setPreview({ bundleId: "", files, index: idx });
+    loadPreview(files, idx);
+  }, [loadPreview]);
+
+  const closePreview = useCallback(() => {
+    if (previewBlobUrl) URL.revokeObjectURL(previewBlobUrl);
+    setPreview(null);
+    setPreviewBlobUrl(null);
+  }, [previewBlobUrl]);
+
+  const navPreview = useCallback((dir: -1 | 1) => {
+    if (!preview) return;
+    const newIdx = preview.index + dir;
+    if (newIdx < 0 || newIdx >= preview.files.length) return;
+    setPreview((p) => p ? { ...p, index: newIdx } : null);
+    loadPreview(preview.files, newIdx);
+  }, [preview, loadPreview]);
+
+  useEffect(() => {
+    if (!preview) return;
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === "ArrowRight") navPreview(1);
+      else if (e.key === "ArrowLeft") navPreview(-1);
+      else if (e.key === "Escape") closePreview();
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [preview, navPreview, closePreview]);
+
   const handleDeleteFile = async (fileId: string, bundle: ShareBundle) => {
     if (!session) return;
-    if (!confirm("این فایل حذف شود؟")) return;
-    try {
-      const updated = await deleteFile(session.token, fileId);
-      setShares((prev) => prev.map((s) => (s.id === updated.id ? updated : s)));
-      showToast("فایل حذف شد");
-    } catch (err) {
-      showToast(err instanceof Error ? err.message : "حذف ناموفق");
-    }
+    setConfirmModal({
+      message: "این فایل حذف شود؟",
+      action: async () => {
+        try {
+          const updated = await deleteFile(session.token, fileId);
+          setShares((prev) => prev.map((s) => (s.id === updated.id ? updated : s)));
+          showToast("فایل حذف شد");
+        } catch (err) {
+          showToast(err instanceof Error ? err.message : "حذف ناموفق");
+        }
+      },
+    });
   };
 
   const handleDeleteShare = async (bundle: ShareBundle) => {
     if (!session) return;
-    if (!confirm(`آیا از حذف «${bundle.title}» اطمینان دارید؟`)) return;
+    setConfirmModal({
+      message: `آیا از حذف «${bundle.title}» اطمینان دارید؟`,
+      action: async () => {
+        try {
+          setDownloadProgress("...");
+          await deleteShare(session.token, bundle.id);
+          setShares((prev) => prev.filter((s) => s.id !== bundle.id));
+          showToast(`«${bundle.title}» حذف شد`);
+        } catch (err) {
+          showToast(err instanceof Error ? err.message : "حذف ناموفق");
+        } finally {
+          setDownloadProgress(null);
+        }
+      },
+    });
+  };
+
+  const handleConsoleSubmit = async () => {
+    if (!consoleInput.trim() || consoleLoading) return;
+    setConsoleLoading(true);
+    setConsoleResponse(null);
     try {
-      setDownloadProgress("...");
-      await deleteShare(session.token, bundle.id);
-      setShares((prev) => prev.filter((s) => s.id !== bundle.id));
-      showToast(`«${bundle.title}» حذف شد`);
-    } catch (err) {
-      showToast(err instanceof Error ? err.message : "حذف ناموفق");
-    } finally {
-      setDownloadProgress(null);
+      await postInstruction(consoleInput.trim());
+      setConsoleInput("");
+      setConsoleLoading(false);
+      showToast("دستور ارسال شد");
+    } catch {
+      setConsoleResponse("خطا در ارسال دستور");
+      setConsoleLoading(false);
     }
   };
 
@@ -310,19 +415,57 @@ export default function App() {
         </button>
       </header>
 
+      {!connected && (
+        <div className="offline-banner">
+          <span>⚠ ارتباط با سرور قطع شد</span>
+          <button
+            type="button"
+            className="btn ghost tiny"
+            style={{ color: "inherit", borderColor: "rgba(255,255,255,0.4)", flexShrink: 0 }}
+            onClick={async () => {
+              try { await hubRef.current?.start(); } catch {}
+            }}
+          >
+            تلاش مجدد
+          </button>
+        </div>
+      )}
+
       <main className="main">
-        {shares.length === 0 ? (
+        {shares.length === 0 && !sharesLoading ? (
           <div className="empty">
+            <div className="empty-icon">📂</div>
             <p>هنوز محتوایی اشتراک گذاشته نشده.</p>
             <p>اولین نفری باشید که فایل می‌گذارد!</p>
+            <button type="button" className="btn primary empty-btn" onClick={() => setShowModal(true)}>
+              اولین اشتراک را ایجاد کنید
+            </button>
           </div>
+        ) : shares.length === 0 && sharesLoading ? (
+          <ul className="share-list">
+            {[1, 2, 3].map((i) => (
+              <li key={i} className="share-card skeleton-card">
+                <div className="skeleton-line w-60" />
+                <div className="skeleton-line w-40" />
+                <div className="skeleton-line w-80" />
+                <div className="skeleton-actions">
+                  <div className="skeleton-btn" />
+                  <div className="skeleton-btn" />
+                  <div className="skeleton-icon" />
+                </div>
+              </li>
+            ))}
+          </ul>
         ) : (
           <ul className="share-list">
             {shares.map((s) => (
-              <li key={s.id} className="share-card">
+              <li key={s.id} className={`share-card${s.authorId === session.userId ? " own-share" : ""}`}>
                 <div className="share-header">
                   <div>
-                    <h2>{s.title}</h2>
+                    <h2>
+                      {s.title}
+                      {s.authorId === session.userId && <span className="own-badge">مال شما</span>}
+                    </h2>
                     <p className="share-meta">
                       {s.authorName} · {formatTime(s.createdAt)} · {s.fileCount} فایل · {formatSize(s.totalSizeBytes)}
                     </p>
@@ -330,7 +473,7 @@ export default function App() {
                   <div className="share-actions">
                     <button
                       type="button"
-                      className="btn primary small-btn"
+                      className="btn primary small-btn zip-btn"
                       onClick={() => handleDownloadZip(s)}
                       disabled={downloadProgress !== null}
                     >
@@ -338,7 +481,7 @@ export default function App() {
                     </button>
                     <button
                       type="button"
-                      className="btn primary small-btn"
+                      className="btn primary small-btn files-btn"
                       onClick={() => handleDownloadFiles(s)}
                       disabled={downloadProgress !== null}
                     >
@@ -370,9 +513,15 @@ export default function App() {
 
                 {expandedId === s.id && (
                   <ul className="file-list">
-                    {s.files.map((f) => (
+                    {s.files.map((f, fi) => (
                       <li key={f.id}>
-                        <span className={f.relativePath ? "has-path" : ""}>
+                        <span className="file-icon">{fileIcon(f.contentType)}</span>
+                        <span
+                          className={f.relativePath ? "has-path" : ""}
+                          onClick={() => f.contentType.startsWith("image/") && openPreview(s.files, fi)}
+                          style={f.contentType.startsWith("image/") ? { cursor: "pointer", textDecoration: "underline", textDecorationStyle: "dotted", textUnderlineOffset: "3px" } : undefined}
+                          title={f.contentType.startsWith("image/") ? "پیش‌نمایش" : undefined}
+                        >
                           {f.relativePath ?? f.originalFileName}
                         </span>
                         <span className="file-size">{formatSize(f.sizeBytes)}</span>
@@ -411,8 +560,9 @@ export default function App() {
                           setAddFileFolderMode(false);
                           setTimeout(() => addFileRef.current?.click(), 10);
                         }}
+                        disabled={addFileUploadPct !== null}
                       >
-                        + افزودن فایل
+                        {addFileUploadPct !== null ? `⏳ ${addFileUploadPct}%` : "+ افزودن فایل"}
                       </button>
                       <button
                         type="button"
@@ -422,8 +572,9 @@ export default function App() {
                           setAddFileFolderMode(true);
                           setTimeout(() => addFolderRef.current?.click(), 10);
                         }}
+                        disabled={addFileUploadPct !== null}
                       >
-                        + افزودن پوشه
+                        {addFileUploadPct !== null ? `⏳ ${addFileUploadPct}%` : "+ افزودن پوشه"}
                       </button>
                       <input
                         ref={addFileRef}
@@ -435,7 +586,7 @@ export default function App() {
                       <input
                         ref={addFolderRef}
                         type="file"
-                        webkitdirectory=""
+                        {...{ webkitdirectory: "" } as any}
                         hidden
                         onChange={handleAddFiles}
                       />
@@ -518,7 +669,7 @@ export default function App() {
               <input
                 ref={folderRef}
                 type="file"
-                webkitdirectory=""
+                {...{ webkitdirectory: "" } as any}
                 hidden
                 onChange={handleFilesPick}
               />
@@ -558,7 +709,97 @@ export default function App() {
         </div>
       )}
 
-      {toast && <div className="toast">{toast}</div>}
+      {confirmModal && (
+        <div className="modal-backdrop" onClick={() => setConfirmModal(null)}>
+          <div className="modal confirm-modal" onClick={(e) => e.stopPropagation()}>
+            <p className="confirm-text">{confirmModal.message}</p>
+            <div className="confirm-actions">
+              <button type="button" className="btn ghost" onClick={() => setConfirmModal(null)}>
+                انصراف
+              </button>
+              <button
+                type="button"
+                className="btn primary"
+                onClick={() => {
+                  const action = confirmModal.action;
+                  setConfirmModal(null);
+                  action();
+                }}
+              >
+                حذف
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {preview && (
+        <div className="lightbox-backdrop" onClick={closePreview}>
+          <button type="button" className="lightbox-close" onClick={closePreview}>✕</button>
+          {preview.index > 0 && (
+            <button type="button" className="lightbox-nav lightbox-prev" onClick={(e) => { e.stopPropagation(); navPreview(-1); }}>‹</button>
+          )}
+          {preview.index < preview.files.length - 1 && (
+            <button type="button" className="lightbox-nav lightbox-next" onClick={(e) => { e.stopPropagation(); navPreview(1); }}>›</button>
+          )}
+          <div className="lightbox-counter">
+            {preview.index + 1} از {preview.files.length}
+            <span className="lightbox-filename">{preview.files[preview.index].originalFileName}</span>
+          </div>
+          {previewLoading ? (
+            <div className="lightbox-spinner" />
+          ) : previewBlobUrl ? (
+            <img src={previewBlobUrl} className="lightbox-img" alt="preview" onClick={(e) => e.stopPropagation()} />
+          ) : null}
+        </div>
+      )}
+
+      <button
+        type="button"
+        className="console-fab"
+        onClick={() => setShowConsole((p) => !p)}
+        aria-label="کنسول"
+      >
+        ⌨
+      </button>
+
+      {showConsole && (
+        <div className="console-modal">
+          <div className="console-header">
+            <h3>کنسول دستورات</h3>
+            <button type="button" className="console-close" onClick={() => setShowConsole(false)}>✕</button>
+          </div>
+          <div className="console-body">
+            <textarea
+              className="console-input"
+              rows={5}
+              placeholder="دستور خود را اینجا بنویسید..."
+              value={consoleInput}
+              onChange={(e) => setConsoleInput(e.target.value)}
+              disabled={consoleLoading}
+            />
+            <button
+              type="button"
+              className="btn primary"
+              onClick={handleConsoleSubmit}
+              disabled={consoleLoading || !consoleInput.trim()}
+            >
+              {consoleLoading ? "در انتظار پاسخ..." : "ارسال"}
+            </button>
+            <button type="button" className="btn ghost tiny" onClick={async () => { const d = await (await fetch("/api/console/pending")).json(); if (d.response) setConsoleResponse(d.response); else showToast("پاسخی نیست"); }}>
+              بررسی پاسخ
+            </button>
+            {consoleResponse && (
+              <div className="console-response">
+                <strong>پاسخ:</strong>
+                <pre>{consoleResponse}</pre>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {toast && <div className="toast" key={toastKey}>{toast}</div>}
     </div>
   );
 }
